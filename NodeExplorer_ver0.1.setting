@@ -1,0 +1,2354 @@
+{
+	Tools = ordered() {
+		NodeExplorer = AlphaDivide {
+            PassThrough = true,
+			CtrlWZoom = false,
+			NameSet = true,
+			ViewInfo = OperatorInfo { Pos = { 7645, -115.5 } },
+-- Custom Data Section
+            CustomData = {
+                NE_Lib = [=[
+                    NodeExplorerUtilityLibrary = {}
+                    local lib = NodeExplorerUtilityLibrary
+
+    -- 内部ヘルパー & 定数 (依存関係なし) *********************************************************
+
+                    -- 再起動時にCustomData内のテーブルデータに __flagsというキーが追加されるのでスキップしてソート
+                    local function FilterAndSortKey(tbl)
+                        local keys = {}
+                        for k in pairs(tbl) do
+                            if type(k) ~= "string" or not k:match("^__") then
+                                table.insert(keys, k)
+                            end
+                        end
+                        table.sort(keys)
+                        return keys
+                    end
+
+
+                    -- pcallのラッパー関数
+                    local function SafeCall(func, ...)
+                        local success, result, errmsg = pcall(func, ...)
+
+                        if not success then
+                            return false, tostring(result)
+                        end
+
+                        if result == nil then
+                            return false, errmsg or "Operation returned no data"
+                        end
+
+                        return true, result
+                    end
+
+
+                    -- csvへ対して無害化
+                    ---@param field string
+                    local function SanitizeCsv(field)
+                        local str = tostring(field)
+                        str = str:gsub('[\n\r]+', ' ')
+                        if str:find('[,"]') then
+                            str = str:gsub('"', '""')
+                            return '"' .. str .. '"'
+                        end
+                        return str
+                    end
+
+
+                    --htmlテンプレート
+                    local HTML_TAG = {
+                        head =  '<head>\n' ..
+                                '  <style>\n' ..
+                                '    body {\n' ..
+                                '      color: #f6f6f6;\n' ..
+                                '    }\n' ..
+                                '    table {\n' ..
+                                '      border-collapse: collapse;\n' ..
+                                '    }\n' ..
+                                '    th, td {\n' ..
+                                '      text-align: left;\n' ..
+                                '      padding: 4px;\n' ..
+                                '    }\n' ..
+                                '    th {\n' ..
+                                '      position: -webkit-sticky;\n' ..
+                                '      position: sticky;\n' ..
+                                '      top: 0;\n' ..
+                                '      z-index: 1;\n' ..
+                                '    }\n' ..
+                                '    caption {\n' ..
+                                '      caption-side: top;\n' ..
+                                '      text-align: center;\n' ..
+                                '    }\n' ..
+                                '    .darker, th, caption {\n' ..
+                                '      background-color: #212126;\n' ..
+                                '    }\n' ..
+                                '    .normal { background-color: #28282e; }\n' ..
+                                '    .key-col { width: 30%; }\n' ..
+                                '    .nested-cell { padding: 0; }\n' ..
+                                '  </style>\n' ..
+                                '</head>\n'  ..
+                                '<body class="normal">\n' ..
+                                '  <table width="100%">',
+                        foot =  '  </table>\n' ..
+                                '</body>'
+                    }
+
+                    -- 文字列の先頭に<head>タグがあれば長いhtmlコンテンツとみなし置き換える
+                    ---@param toShortHtml boolean|nil  # 省略可引数
+                    local function ReplaceLongHtml(str, toShortHtml)
+                        if type(str) == "string" and str:find("<head>", 1, true) then
+                            return toShortHtml
+                            and '<p style="color: #000000;">HTML Contents</p>'
+                            or "HTML Contents"
+                        end
+                        return str
+                    end
+
+    -- 内部ヘルパー関数 (PROCESS_CONFIG依存) *****************************************************
+
+                    -- ターゲットを指定する文字列を`.`の前後で分割。`.`が無い場合は自ノードとみなす
+                    ---@param targetStr string # "ToolName.InputID"
+                    ---@return string # nodeStr
+                    ---@return string # controlStr
+                    local function SplitTargetStr(targetStr)
+                        local nodeStr, controlStr
+                        if not string.find(targetStr, "%.") then
+                            nodeStr, controlStr = tool.Name, targetStr
+                        else
+                            nodeStr, controlStr = string.match(targetStr, "([^.]+)%.(.*)")
+                        end
+                            return nodeStr, controlStr
+                    end
+
+
+                    -- ノードやコントロールの存在チェック
+                    ---@param nodeStr string
+                    ---@param controlStr string
+                    ---@return userdata, userdata, string #ToolObject,InputObject, message
+                    local function CheckTargetExists(nodeStr, controlStr)
+                        local node = comp:FindTool(nodeStr)
+                        if not node then
+                            return nil, nil, "The target node cannot be found"
+                        end
+
+                        local control = node[controlStr]
+                        if not control then
+                            return nil, nil, "The target control cannot be found"
+                        end
+                        return node, control, nil
+                    end
+
+                    -- 選択範囲のバリデーション
+                    ---@param mbtControlID string # "NOD_AllOrSelected_Mbt"|"CNT_AllOrSelected_Mbt"
+                    local function ValidateScope(mbtControlID)
+                        local isSelected = (tool:GetInput(mbtControlID) == 1)
+                        local nodes = comp:GetToolList(isSelected)
+                        if isSelected and #nodes < 1 then
+                            return false, "No nodes are selected."
+                        end
+                        return true, nodes  -- @table(ToolList)
+                    end
+
+
+                    local function ValidateNode()
+                        return ValidateScope("NOD_AllOrSelected_Mbt")
+                    end
+
+
+                    local function ValidateControl()
+                        return ValidateScope("CNT_AllOrSelected_Mbt")
+                    end
+
+
+                    local function ValidateAttrs()
+                        local success, control, node, err = lib.ValidateTarget("ATT_Target_Txt")
+                        if not success then
+                            return false, err
+                        end
+                        return true, control, node.Name -- @boolean, userdata(InputObject), string
+                    end
+
+    -- データ収集関数 (PROCESS_CONFIG依存) *******************************************************
+
+                    ---@param nodes table
+                    local function CollectNodeData(nodes)
+                        local nodeList = {}
+
+                        for _, node in pairs(nodes) do
+                            local attrs = node:GetAttrs()
+                            nodeList[node.Name] = {
+                                RegID = attrs.TOOLS_RegID,
+                                Visible = attrs.TOOLB_Visible,
+                                PassThrough = attrs.TOOLB_PassThrough or false,
+                                ParentTool = node.ParentTool
+                                and node.ParentTool.Name
+                                or "No parent"
+                            }
+                        end
+
+                        return nodeList
+                    end
+
+
+                    local function CollectControlData(nodes)
+                        local controlList = {}
+                        local inputType = tool:GetInput("CNT_InputControl_Cmb")
+                        for _, node in pairs(nodes) do
+                            local nodeControls = {}
+                            local controls = node:GetInputList()
+                            for _, control in pairs(controls) do
+                                local attrs = control:GetAttrs()
+                                if inputType == "All"
+                                or attrs.INPID_InputControl == inputType then
+                                    table.insert(nodeControls, {
+                                        ID = attrs.INPS_ID,
+                                        Name = attrs.INPS_Name,
+                                        Type = attrs.INPID_InputControl
+                                    })
+                                end
+                            end
+
+                            if #nodeControls > 0 then
+                                controlList[node.Name] = nodeControls
+                            end
+                        end
+
+                        if next(controlList) == nil then
+                            return nil, "No matching controls found."
+                        end
+                        return controlList
+                    end
+
+
+                    ---@param control userdata # InputObject
+                    ---@param nodeStr string
+                    ---@return table
+                    local function CollectAttrsData(control, nodeStr)
+                        local attrs = control:GetAttrs()
+
+                        local attrsList = {
+                            Node = nodeStr,
+                            Control = attrs.INPS_ID,
+                            Attributes = attrs,
+                        }
+                        return attrsList
+                    end
+
+    -- コア変換ロジック (PROCESS_CONFIG依存) *****************************************************
+        -- Node List ===========================================================================
+
+                    local function NodeListToText(nodeList)
+                        local lines = {}
+                        local nodeNames = FilterAndSortKey(nodeList)
+                        for _, nodeName in ipairs(nodeNames) do
+                            local info = nodeList[nodeName]
+                            if type(info) == "table" then
+                                table.insert(lines, string.format(
+                                    '%s\n' ..
+                                    '        RegID = "%s"\n' ..
+                                    '        Visible = %s\n' ..
+                                    '        PassThrough = %s\n' ..
+                                    '        ParentTool = "%s"',
+                                    nodeName,
+                                    info.RegID,
+                                    tostring(info.Visible),
+                                    tostring(info.PassThrough),
+                                    info.ParentTool
+                                ))
+                            end
+                        end
+                        return table.concat(lines, "\n")
+                    end
+
+
+                    local function NodeListToHtml(nodeList)
+                        local tag = HTML_TAG
+
+                        local html = {tag.head}
+                        table.insert(html,
+                            '    <tr>\n' ..
+                            '      <th>Node Name</th>\n' ..
+                            '      <th>RegID</th>\n' ..
+                            '      <th>Visible</th>\n' ..
+                            '      <th>PassThrough</th>\n' ..
+                            '      <th>ParentTool</th>\n' ..
+                            '    </tr>'
+                        )
+
+                        local i = 0
+                        local nodeNames = FilterAndSortKey(nodeList)
+                        for _, nodeName in ipairs(nodeNames) do
+                            local info = nodeList[nodeName]
+                            if type(info) == "table" then
+                                i = i + 1
+                                local cssClass = (i % 2 == 0) and "darker" or "normal"
+                                table.insert(html, string.format(
+                                    '    <tr class="%s">\n' ..
+                                    '      <td>%s</td>\n' ..
+                                    '      <td>%s</td>\n' ..
+                                    '      <td>%s</td>\n' ..
+                                    '      <td>%s</td>\n' ..
+                                    '      <td>%s</td>\n' ..
+                                    '    </tr>',
+                                    cssClass,
+                                    nodeName,
+                                    info.RegID,
+                                    tostring(info.Visible),
+                                    tostring(info.PassThrough),
+                                    info.ParentTool == "No parent" and "" or info.ParentTool
+                                ))
+                            end
+                        end
+                        table.insert(html, tag.foot)
+
+                        return table.concat(html, "\n")
+                    end
+
+
+                    local function NodeListToCSV(nodeList)
+                        local csvLines = {"NodeName,RegID,Visible,PassThrough,ParentTool"}
+                        local nodeNames = FilterAndSortKey(nodeList)
+                        for _, nodeName in ipairs(nodeNames) do
+                            local info = nodeList[nodeName]
+                            if type(info) == "table" then
+                                table.insert(csvLines, string.format(
+                                    "%s,%s,%s,%s,%s",
+                                    nodeName,
+                                    info.RegID,
+                                    tostring(info.Visible),
+                                    tostring(info.PassThrough),
+                                    info.ParentTool
+                                ))
+                            end
+                        end
+                        return table.concat(csvLines, "\n")
+                    end
+
+        -- Control List ========================================================================
+
+                    local function ControlListToText(controlList)
+                        local block = {}
+                        local nodeNames = FilterAndSortKey(controlList)
+                        for _, nodeName in ipairs(nodeNames) do
+                            local controls = controlList[nodeName]
+                            if type(controls) == "table" then
+                                local controlLines = {}
+                                for _, control in ipairs(controls) do
+                                    local controlName = ReplaceLongHtml(control.Name)
+                                    table.insert(controlLines, string.format(
+                                        '%s\n' ..
+                                        '        Name = "%s"\n' ..
+                                        '        InputControl = "%s"',
+                                        control.ID,
+                                        controlName,
+                                        control.Type
+                                    ))
+                                end
+
+                                table.insert(block, string.format(
+                                    '*****%s\n' ..
+                                    '%s\n' ..
+                                    '%s\n' ..
+                                    '%s',
+                                    string.rep("=", 35),
+                                    nodeName,
+                                    string.rep("=", 40),
+                                    table.concat(controlLines, "\n")
+                                ))
+                            end
+                        end
+
+                        return table.concat(block, "\n")
+                    end
+
+
+                    local function ControlListToHtml(controlList)
+                        local tag = HTML_TAG
+                        local html = {tag.head}
+
+                        table.insert(html,
+                            '    <tr class="darker">\n' ..
+                            '      <th>NodeName</th>\n' ..
+                            '      <th>ID</th>\n' ..
+                            '      <th>Name</th>\n' ..
+                            '      <th>InputControl</th>\n' ..
+                            '    </tr>'
+                        )
+
+                        local i = 0
+                        local nodeNames = FilterAndSortKey(controlList)
+                        for _, nodeName in ipairs(nodeNames) do
+                            local controls = controlList[nodeName]
+                            if type(controls) == "table" then
+                                local isFirstRow = true
+                                for _, control in ipairs(controls) do
+                                    i = i + 1
+                                    local cssClass = (i % 2 == 0) and "darker" or "normal"
+
+                                    local nodeNameCell = ""
+                                    if isFirstRow then
+                                        nodeNameCell = nodeName
+                                        isFirstRow = false
+                                    end
+
+                                    local controlName = ReplaceLongHtml(control.Name, true)
+
+                                    table.insert(html, string.format(
+                                        '    <tr class="%s">\n' ..
+                                        '      <td>%s</td>\n' ..
+                                        '      <td>%s</td>\n' ..
+                                        '      <td>%s</td>\n' ..
+                                        '      <td>%s</td>\n' ..
+                                        '    </tr>',
+                                        cssClass,
+                                        nodeNameCell,
+                                        control.ID,
+                                        controlName,
+                                        control.Type
+                                    ))
+                                end
+                            end
+                        end
+                        table.insert(html, tag.foot)
+
+                        return table.concat(html, "\n")
+                    end
+
+                    local function ControlListToCSV(controlList)
+                        local csvLines = {"NodeName,ID,Name,InputControl"}
+
+                        local nodeNames = FilterAndSortKey(controlList)
+                        for _, nodeName in ipairs(nodeNames) do
+                            local controls = controlList[nodeName]
+                            if type(controls) == "table" then
+                                for _, control in ipairs(controls) do
+                                    local controlName = SanitizeCsv(ReplaceLongHtml(control.Name))
+                                    table.insert(csvLines, string.format(
+                                        "%s,%s,%s,%s",
+                                        nodeName,
+                                        control.ID,
+                                        controlName,
+                                        control.Type
+                                    ))
+                                end
+                            end
+                        end
+
+                        return table.concat(csvLines, "\n")
+                    end
+
+        -- Attrs List ==========================================================================
+
+                    local function AttrsListToText(attrsList)
+                        local header = string.format(
+                            '*****%s\n' ..
+                            '%s.%s\n' ..
+                            '%s',
+                            string.rep("=", 35),
+                            attrsList.Node,
+                            attrsList.Control,
+                            string.rep("=", 40)
+                        )
+
+                        local function formatValue(value)
+                            local displayValue = ReplaceLongHtml(value)
+                            if type(value) == "string" then
+                                return '"' .. displayValue .. '"'
+                            end
+                            return tostring(displayValue)
+                        end
+
+                        local function recurText(tbl, indent)
+                            local lines = {}
+                            indent = indent or ""
+                            local keys = FilterAndSortKey(tbl)
+
+                            for _, key in ipairs(keys) do
+                                local value = tbl[key]
+                                if type(value) == "table" then
+                                    if next(value) == nil then
+                                        table.insert(lines, string.format(
+                                            '%s%s = { }',
+                                            indent, tostring(key)
+                                        ))
+                                    else
+                                        table.insert(lines, string.format(
+                                            '%s%s = {', indent, tostring(key)
+                                        ))
+                                        local subLines = recurText(value, indent .. "    ")
+                                        if subLines ~= "" then
+                                            table.insert(lines, subLines)
+                                        end
+                                        table.insert(lines, string.format('%s}', indent))
+                                    end
+                                else
+                                    table.insert(lines, string.format(
+                                        '%s%s = %s',
+                                        indent, tostring(key), formatValue(value)
+                                    ))
+                                end
+                            end
+                            return table.concat(lines, "\n")
+                        end
+
+                        local body = recurText(attrsList.Attributes)
+                        return header .. "\n" .. body
+                    end
+
+
+                    local function AttrsListToHtml(attrsList)
+                        local tag = HTML_TAG
+                        local buildRows, buildCell
+
+                        buildCell = function(value, indent)
+                            if type(value) ~= "table" then
+                                local valueStr
+                                if type(value) == "string" then
+                                    valueStr = ReplaceLongHtml(value, true)
+                                    if valueStr == value then
+                                        valueStr = '"' .. valueStr .. '"'
+                                    end
+                                else
+                                    valueStr = tostring(value)
+                                end
+                                return indent .. "<td>" .. valueStr .. "</td>"
+                            end
+
+                            if next(value) == nil then
+                                return indent .. "<td>{ }</td>"
+                            end
+
+                            local subIndent = indent .. "  "
+                            local subHeader = string.format(
+                                '%s<tr class="darker">\n' ..
+                                '%s  <th class="key-col">Key</th>\n' ..
+                                '%s  <th>Value</th>\n' ..
+                                '%s</tr>',
+                                subIndent, subIndent, subIndent, subIndent
+                            )
+
+                            local subTable = {
+                                indent .. '<td class="nested-cell">',
+                                subIndent .. '<table width="100%">',
+                                subHeader,
+                                buildRows(value, subIndent .. "  "),
+                                subIndent .. '</table>',
+                                indent .. '</td>'
+                            }
+                            return table.concat(subTable, "\n")
+                        end
+
+                        buildRows = function(tbl, indent)
+                            local rows = {}
+                            local keys = FilterAndSortKey(tbl)
+
+                            for i, key in ipairs(keys) do
+                                local value = tbl[key]
+                                local cssClass = (i % 2 == 0) and "darker" or "normal"
+                                local valueCell = buildCell(value, indent .. "  ")
+
+                                table.insert(rows, string.format(
+                                    '%s<tr class="%s">\n' ..
+                                    '%s  <td>%s</td>\n' ..
+                                    '%s\n' ..
+                                    '%s</tr>',
+                                    indent, cssClass,
+                                    indent, tostring(key),
+                                    valueCell,
+                                    indent
+                                ))
+                            end
+                            return table.concat(rows, "\n")
+                        end
+
+                        local caption = string.format(
+                            '    <caption>%s.%s</caption>',
+                            attrsList.Node, attrsList.Control
+                        )
+
+                        local tHeader = '    <tr class="darker">\n' ..
+                                        '      <th class="key-col">Key</th>\n' ..
+                                        '      <th>Value</th>\n' ..
+                                        '    </tr>'
+
+                        local html = {tag.head}
+                        table.insert(html, caption)
+                        table.insert(html, tHeader)
+                        table.insert(html, buildRows(attrsList.Attributes, "    "))
+                        table.insert(html, tag.foot)
+
+                        return table.concat(html, "\n")
+                    end
+
+
+                    local function AttrsListToCSV(attrsList)
+                        local csvLines = {"Key,Value"}
+
+                        local function recurCsv(tbl, prefix)
+                            local keys = FilterAndSortKey(tbl)
+
+                            for _, key in ipairs(keys) do
+                                local value = tbl[key]
+                                local currentKey
+                                if prefix then
+                                    currentKey = prefix .. "." .. tostring(key)
+                                else
+                                    currentKey = tostring(key)
+                                end
+
+                                if type(value) == "table" then
+                                    if next(value) == nil then
+                                        local line = string.format(
+                                            '%s,"{ }"', SanitizeCsv(currentKey)
+                                        )
+                                        table.insert(csvLines, line)
+                                    else
+                                        recurCsv(value, currentKey)
+                                    end
+                                else
+                                    local line = string.format(
+                                        "%s,%s",
+                                        SanitizeCsv(currentKey),
+                                        SanitizeCsv(ReplaceLongHtml(value)))
+                                    table.insert(csvLines, line)
+                                end
+
+                            end
+                        end
+
+                        local prefix = attrsList.Node .. "." .. attrsList.Control
+                        recurCsv(attrsList.Attributes, prefix)
+
+                        return table.concat(csvLines, "\n")
+                    end
+
+    -- 定数テーブル *****************************************************************************
+
+                    local PROCESS_CONFIG = {
+                        node = {
+                            list = "NodeList",
+                            output = "NOD_TextBox_Txt",
+                            indicator = "CCH_NodeList_Lbl",
+                            collectFunc = CollectNodeData,
+                            validateFunc = ValidateNode,
+                            formatSelector = "NOD_FormatSelect_Mbt",
+                            formats = {
+                                txt = {
+                                    formatted = "NodeListText",
+                                    formatFunc = NodeListToText,
+                                    indicator = "CCH_NodeTxt_Lbl"
+                                },
+                                html = {
+                                    formatted = "NodeListHtml",
+                                    formatFunc = NodeListToHtml,
+                                    indicator = "CCH_NodeHtml_Lbl"
+                                },
+                                csv = {
+                                    formatted = "NodeListCSV",
+                                    formatFunc = NodeListToCSV,
+                                    indicator = "CCH_NodeCSV_Lbl"
+                                }
+                            }
+                        },
+                        control = {
+                            list = "ControlList",
+                            output = "CNT_TextBox_Txt",
+                            indicator = "CCH_ControlList_Lbl",
+                            collectFunc = CollectControlData,
+                            validateFunc = ValidateControl,
+                            formatSelector = "CNT_FormatSelect_Mbt",
+                            formats = {
+                                txt = {
+                                    formatted = "ControlListText",
+                                    formatFunc = ControlListToText,
+                                    indicator = "CCH_ControlTxt_Lbl"
+                                },
+                                html = {
+                                    formatted = "ControlListHtml",
+                                    formatFunc = ControlListToHtml,
+                                    indicator = "CCH_ControlHtml_Lbl"
+                                },
+                                csv = {
+                                    formatted = "ControlListCSV",
+                                    formatFunc = ControlListToCSV,
+                                    indicator = "CCH_ControlCSV_Lbl"
+                                }
+                            }
+                        },
+                        attrs = {
+                            list = "AttrsList",
+                            output = "ATT_TextBox_Txt",
+                            indicator = "CCH_AttrsList_Lbl",
+                            collectFunc = CollectAttrsData,
+                            validateFunc = ValidateAttrs,
+                            formatSelector = "ATT_FormatSelect_Mbt",
+                            formats = {
+                                txt = {
+                                    formatted = "AttrsListText",
+                                    formatFunc = AttrsListToText,
+                                    indicator = "CCH_AttrsTxt_Lbl"
+                                },
+                                html = {
+                                    formatted = "AttrsListHtml",
+                                    formatFunc = AttrsListToHtml,
+                                    indicator = "CCH_AttrsHtml_Lbl"
+                                },
+                                csv = {
+                                    formatted = "AttrsListCSV",
+                                    formatFunc = AttrsListToCSV,
+                                    indicator = "CCH_AttrsCSV_Lbl"
+                                }
+                            }
+                        }
+                    }
+
+    -- ヘルパー関数  ****************************************************************************
+
+                    -- インジケーターを更新
+                    ---@param data string # "cacheData"
+                    ---@param indicator string # "inputID"
+                    local function UpdateIndicator(data, indicator)
+                        local val = tool:GetData(data)
+                        local hasCache = val and val ~= ""
+                        tool[indicator]:SetAttrs({INPS_Name = string.format(
+                            '<p style="color: %s">%s</p>',
+                            hasCache and "#5f9920" or "#5a5f66",
+                            hasCache and "●" or "○"
+                        )})
+                    end
+
+                    -- キャッシュクリアとインジケーターの更新
+                    function lib.RefreshCache(data, indicator)
+                        tool:SetData(data, nil)
+                        UpdateIndicator(data, indicator)
+                    end
+
+
+                    -- インジケーターの更新(グループ)
+                    ---@param group string # "node"|"control"|"attrs"
+                    function lib.UpdateIndicatorGroup(group)
+                        local groupConfig = PROCESS_CONFIG[group]
+                        UpdateIndicator(groupConfig.list, groupConfig.indicator)
+                        local formats = groupConfig.formats
+                        for _, formatConfig in pairs(formats) do
+                            UpdateIndicator(formatConfig.formatted, formatConfig.indicator)
+                        end
+                    end
+
+
+                    -- キャッシュをクリアしインジケーターを更新(グループ)
+                    ---@param group string # "node"|"control"|"attrs"
+                    function lib.RefreshCacheGroup(group)
+                        local groupConfig = PROCESS_CONFIG[group]
+                        lib.RefreshCache(groupConfig.list, groupConfig.indicator)
+                        local formats = groupConfig.formats
+                        for _, formatConfig in pairs(formats) do
+                            lib.RefreshCache(formatConfig.formatted, formatConfig.indicator)
+                        end
+                    end
+
+    -- フォーマットフロー関数  ********************************************************************
+
+                    ---@param group string # "node"| "control"| "attrs"
+                    ---@param formatType string # "txt"| "html"| "csv"
+                    function lib.ApplyFormat(group, formatType)
+                        local groupConfig = PROCESS_CONFIG[group]
+                        local formatConfig = groupConfig.formats[formatType]
+
+                        local function setContents(contents)
+                            tool:SetInput(groupConfig.output, contents)
+                        end
+
+                        local cachedData = tool:GetData(formatConfig.formatted)
+                        if cachedData and cachedData ~= "" then
+                            setContents(cachedData)
+                            return
+                        end
+
+                        local list = tool:GetData(groupConfig.list)
+                        if not list then
+                            setContents("No List. Press the Update Btn")
+                            return
+                        end
+
+                        local success, result = SafeCall(formatConfig.formatFunc, list)
+                        if success then
+                            tool:SetData(formatConfig.formatted, result)
+                            setContents(result)
+                        else
+                            setContents(result)
+                        end
+
+                        UpdateIndicator(formatConfig.formatted, formatConfig.indicator)
+                    end
+
+    -- メインアップデートプロセス *****************************************************************
+
+                    ---@param group string # "node"|"control"|"attrs"
+                    function lib.ApplyUpdate(group)
+                        local config = PROCESS_CONFIG[group]
+                        local output = config.output
+                        local prerequisites = {}
+
+                        if config.validateFunc then
+                            local success, result1, result2 = config.validateFunc()
+                            if not success then
+                                local err = result1
+                                tool:SetInput(output, err)
+                                return
+                            end
+                            if result1 then table.insert(prerequisites, result1) end
+                            if result2 then table.insert(prerequisites, result2) end
+                        end
+
+                        lib.RefreshCacheGroup(group)
+
+                        local success, result = SafeCall(config.collectFunc, unpack(prerequisites))
+                        if not success then
+                            tool:SetInput(output, result)
+                            return
+                        end
+
+                        tool:SetData(config.list, result)
+                        UpdateIndicator(config.list, config.indicator)
+
+                        local formatType = tool:GetInput(config.formatSelector)
+                        lib.ApplyFormat(group, formatType)
+                    end
+
+
+    -- その他公開関数 ****************************************************************************
+
+                    -- Expressionのピックアップ機能を利用しターゲットを文字列で取得する
+                    ---@param control userdata # InputObject selfを明示的に渡すため
+                    ---@param prefix string # "ATT"| "SCR"
+                    function lib.PickUpTarget(control, prefix)
+                        if tool:GetData(prefix .. "_PickerBusy") then return end
+
+                        local targetStr = control:GetExpression()
+
+                        if targetStr and targetStr ~= "" and targetStr ~= 'Text("")' then
+                            tool:SetData(prefix .. "_PickerBusy", true)
+
+                            control:SetExpression(nil)
+
+                            local success, err = pcall(function()
+                                tool:SetInput(prefix .. "_Target_Txt", targetStr)
+                            end)
+
+                            if not success then
+                                tool:SetInput(prefix .. "_Target_Txt", tostring(err))
+                            end
+
+                            tool:SetData(prefix .. "_PickerBusy", nil)
+                        end
+                    end
+
+
+                    -- 不要なインデントを除去
+                    function lib.TrimIndent(text)
+                        text = text:gsub("^\n", ""):gsub("\n%s*$", "")
+
+                        local min = math.huge
+                        for line in text:gmatch("[^\n]+") do
+                            local s = line:match("^(%s*)%S")
+                            if s and #s < min then min = #s end
+                        end
+
+                        if min < math.huge then
+                            local p = "\n" .. string.rep(" ", min)
+                            text = text:gsub(p, "\n"):gsub("^" .. string.rep(" ", min), "")
+                        end
+                        return text
+                    end
+
+
+                    -- 入力フィールドバリデーションプロセス
+                    ---@param inputField string
+                    function lib.ValidateTarget(inputField)
+                        local targetStr = tool:GetInput(inputField)
+                        if not targetStr or targetStr == "" then
+                            return false, nil, nil, "Enter the target"
+                        end
+
+                        local nodeStr, controlStr = SplitTargetStr(targetStr)
+                        local node, control, err = CheckTargetExists(nodeStr, controlStr)
+                        if err then
+                            return false, nil, nil, err
+                        end
+
+                        return true, control, node, nil
+                    end
+
+
+                    -- GetScriptプロセス
+                    function lib.GetScript()
+                        local output = "SCR_TextBox_Txt"
+                        local success, control, node, err = lib.ValidateTarget("SCR_Target_Txt")
+
+                        if not success then
+                            tool:SetInput(output, err)
+                            return
+                        end
+
+                        local scriptType = tool:GetInput("SCR_ScriptType_Cmb")
+                        local script
+
+                        if scriptType == "Expression" then
+                            script = control:GetExpression()
+                        elseif scriptType == "OnChange" then
+                            script = control:GetAttrs().INPS_ExecuteOnChange
+                        elseif scriptType == "Button" then
+                            local uc = node.UserControls[control.ID]
+                            if not uc then
+                                tool:SetInput(output, "It is not a UserControl")
+                                return
+                            end
+                            script = uc.BTNCS_Execute
+                        end
+
+                        if not script or script == "" then
+                            script = "No script found"
+                        else
+                            script = lib.TrimIndent(script)
+                        end
+
+                        tool:SetInput(output, script)
+                    end
+
+
+                    -- 初期化完了イベント
+                    function lib.InitializeNE()
+                        local uc = tool.UserControls
+                        for id, attrs in pairs(uc) do
+                            if type(attrs) == "table"
+                            and attrs.INPID_InputControl
+                            and not attrs.CntToHide then
+                                tool[id]:SetAttrs({INPB_IC_Visible = true})
+                            end
+                        end
+
+                        for _, group in ipairs({"node", "control", "attrs"}) do
+                            lib.UpdateIndicatorGroup(group)
+                        end
+
+                        tool.LIB_Status_Lbl:SetAttrs({
+                            INPS_Name = '<p style="color: #5f9920">Loading success</p>'
+                        })
+                    end
+
+    -- ライブラリの読み込み完了を通知 *************************************************************
+                    NodeExplorer:SetInput("LIB_Status_Lbl", 1)
+    -- =========================================================================================
+                ]=],
+            },
+-- User Controls
+    -- Explorer page
+            UserControls = ordered() {
+                SEC_LabelControler_Mbt = {
+                    INPID_InputControl = "MultiButtonControl",
+                    LINKID_DataType = "Number",
+                    { MBTNC_AddButton = "Node", },
+                    { MBTNC_AddButton = "Control", },
+                    { MBTNC_AddButton = "Attrs", },
+                    { MBTNC_AddButton = "Script", },
+                    { MBTNC_AddButton = "Clip", },
+                    INP_Default = 31,
+                    IC_Visible = false,
+                    INP_Integer = true,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    MBTNC_StretchToFit = true,
+                    MBTNC_Type = "Toggle",
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "SectionLabelControler",
+                    INPS_ExecuteOnChange = [[
+                        local labels = {
+                            "NOD_Section_Lbl",
+                            "CNT_Section_Lbl",
+                            "ATT_Section_Lbl",
+                            "SCR_Section_Lbl",
+                            "CLP_Section_Lbl",
+                        }
+                        for i, label in ipairs(labels) do
+                            local value = 2^(i - 1)
+                            local openClose = bit.band(self[0], value) ~= 0 and 1 or 0
+                            tool:SetInput(label, openClose)
+                        end
+                    ]],
+                },
+        -- Node Section
+                NOD_Section_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    INP_Default = 1,
+                    LBLC_NumInputs = 10,
+                    LBLC_DropDownButton = true,
+                    IC_Visible = false,
+					CntToHide = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                NOD_Section_Sep = {
+                    INPID_InputControl = "SeparatorControl",
+                    IC_Visible = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                NOD_Title_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    IC_Visible = false,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = '<p style="color: #2bb7fc">Node</p>',
+                },
+                NOD_Scope_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.6,
+                    IC_Visible = false,
+                    LBLC_DropDownButton = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = '<p style="color: #f6f6f6; text-align: right">Scope</p>',
+                },
+                NOD_AllOrSelected_Mbt = {
+                    INPID_InputControl = "MultiButtonControl",
+                    LINKID_DataType = "Number",
+                    { MBTNC_AddButton = "All", },
+                    { MBTNC_AddButton = "Selected", },
+                    INP_Default = 0,
+                    ICD_Width = 0.4,
+                    IC_Visible = false,
+                    INP_Integer = true,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "All or Selected",
+                },
+                NOD_1_Spc = {
+                    INPID_InputControl = "SpacerControl",
+                    IC_Visible = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                NOD_FormatSelect_Mbt = {
+                    INPID_InputControl = "MultiButtonIDControl",
+                    LINKID_DataType = "FuID",
+                    { MBTNC_AddButton = "TXT",  MBTNCID_AddID = "txt" },
+                    { MBTNC_AddButton = "HTML", MBTNCID_AddID = "html" },
+                    { MBTNC_AddButton = "CSV",  MBTNCID_AddID = "csv" },
+                    ICD_Width = 0.5,
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    INPID_DefaultID = "txt",
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Format Select",
+                    INPS_ExecuteOnChange = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.ApplyFormat("node", self[0])
+                    ]],
+                },
+                NOD_Update_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    ICD_Width = 0.2,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Update",
+					BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.ApplyUpdate("node")
+                    ]],
+				},
+                NOD_TextCopy_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Copy",
+                    BTNCS_Execute = "bmd.setclipboard(tool:GetInput('NOD_TextBox_Txt'))",
+                },
+                NOD_TextClear_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Clear",
+					BTNCS_Execute = "tool:SetInput('NOD_TextBox_Txt', '')",
+				},
+                NOD_TextBox_Txt = {
+                    INPID_InputControl = "TextEditControl",
+                    LINKID_DataType = "Text",
+                    TEC_Lines = 10,
+                    ICD_Width = 1,
+                    IC_Visible = false,
+                    INP_External = false,
+                    INP_Passive = true,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    TEC_Wrap = false,
+                    TECS_Language = "lua",
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Node List Text Box",
+                    INPS_DefaultText =  "-- Select options (SearchScope, Format)--\n" ..
+                                        "-- Press the Update button --"
+                },
+        -- Control Section
+                CNT_Section_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    INP_Default = 1,
+                    LBLC_NumInputs = 12,
+                    LBLC_DropDownButton = true,
+                    IC_Visible = false,
+					CntToHide = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                CNT_Section_Sep = {
+                    INPID_InputControl = "SeparatorControl",
+                    IC_Visible = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                CNT_Title_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = '<p style="color: #f8cd1c">Control</p>',
+                },
+                CNT_Input_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.155,
+                    IC_Visible = false,
+                    LBLC_DropDownButton = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = '<p style="color: #f6f6f6; text-align: right">Input</p>',
+                },
+                CNT_InputControl_Cmb = {
+                    INPID_InputControl = "ComboIDControl",
+                    LINKID_DataType = "FuID",
+                    { CCS_AddString = "All",             CCID_AddID = "All" },
+                    { CCS_AddString = "Slider",          CCID_AddID = "SliderControl" },
+					{ CCS_AddString = "Screw",           CCID_AddID = "ScrewControl" },
+					{ CCS_AddString = "Range",           CCID_AddID = "RangeControl" },
+					{ CCS_AddString = "Checkbox",        CCID_AddID = "CheckboxControl" },
+                    { CCS_AddString = "Button",          CCID_AddID = "ButtonControl" },
+                    { CCS_AddString = "Combo",           CCID_AddID = "ComboControl" },
+                    { CCS_AddString = "ComboID",         CCID_AddID = "ComboIDControl" },
+                    { CCS_AddString = "MultiButton",     CCID_AddID = "MultiButtonControl" },
+                    { CCS_AddString = "MultiButtonID",   CCID_AddID = "MultiButtonIDControl" },
+                    { CCS_AddString = "Label",           CCID_AddID = "LabelControl" },
+                    { CCS_AddString = "Nest",            CCID_AddID = "NestControl" },
+                    { CCS_AddString = "Color",           CCID_AddID = "ColorControl" },
+                    { CCS_AddString = "ColorWheel",      CCID_AddID = "ColorWheelControl" },
+                    { CCS_AddString = "ColorSuppression",CCID_AddID = "ColorSuppressionControl" },
+                    { CCS_AddString = "ColorGamut",      CCID_AddID = "ColorGamutControl" },
+                    { CCS_AddString = "Gradient",        CCID_AddID = "GradientControl" },
+                    { CCS_AddString = "Log",             CCID_AddID = "LogControl" },
+                    { CCS_AddString = "Levels",          CCID_AddID = "LevelsControl" },
+                    { CCS_AddString = "LevelsOutput",    CCID_AddID = "LevelsOutputControl" },
+                    { CCS_AddString = "Offset",          CCID_AddID = "OffsetControl" },
+                    { CCS_AddString = "TextEdit",        CCID_AddID = "TextEditControl" },
+                    { CCS_AddString = "File",            CCID_AddID = "FileControl" },
+                    { CCS_AddString = "Font",            CCID_AddID = "FontControl" },
+                    { CCS_AddString = "Layer",           CCID_AddID = "LayerControl" },
+                    { CCS_AddString = "LayerList",       CCID_AddID = "LayerListControl" },
+                    { CCS_AddString = "Spacer",          CCID_AddID = "SpacerControl" },
+                    { CCS_AddString = "Separator",       CCID_AddID = "SeparatorControl" },
+                    ICD_Width = 0.345,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Input Control",
+                },
+                CNT_Scope_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.105,
+                    IC_Visible = false,
+                    LBLC_DropDownButton = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = '<p style="color: #f6f6f6; text-align: right">Scope</p>',
+                },
+                CNT_AllOrSelected_Mbt = {
+                    INPID_InputControl = "MultiButtonControl",
+                    LINKID_DataType = "Number",
+                    { MBTNC_AddButton = "All", },
+                    { MBTNC_AddButton = "Selected", },
+                    INP_Default = 0,
+                    ICD_Width = 0.395,
+                    IC_Visible = false,
+                    INP_Integer = true,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "All or Selected",
+                },
+                CNT_1_Spc = {
+                    INPID_InputControl = "SpacerControl",
+                    IC_Visible = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                CNT_FormatSelect_Mbt = {
+                    INPID_InputControl = "MultiButtonIDControl",
+                    LINKID_DataType = "FuID",
+                    { MBTNC_AddButton = "TXT",  MBTNCID_AddID = "txt" },
+                    { MBTNC_AddButton = "HTML", MBTNCID_AddID = "html" },
+                    { MBTNC_AddButton = "CSV",  MBTNCID_AddID = "csv" },
+                    ICD_Width = 0.5,
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    INPID_DefaultID = "txt",
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Format Select",
+                    INPS_ExecuteOnChange = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.ApplyFormat("control", self[0])
+                    ]],
+                },
+                CNT_Update_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.2,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Update",
+					BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.ApplyUpdate("control")
+                    ]],
+				},
+                CNT_TextCopy_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Copy",
+                    BTNCS_Execute = "bmd.setclipboard(tool:GetInput('CNT_TextBox_Txt'))",
+                },
+                CNT_TextClear_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Clear",
+					BTNCS_Execute = "tool:SetInput('CNT_TextBox_Txt', '')",
+				},
+                CNT_TextBox_Txt = {
+                    INPID_InputControl = "TextEditControl",
+                    LINKID_DataType = "Text",
+                    TEC_Lines = 10,
+                    ICD_Width = 1,
+                    IC_Visible = false,
+                    INP_External = false,
+                    INP_Passive = true,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    TEC_Wrap = false,
+                    TECS_Language = "lua",
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Control List Text Box",
+                    INPS_DefaultText =  "-- Select options (InputType, SearchScope, Format) --\n" ..
+                                        "-- Press the Update button --"
+                },
+        -- Attrs Section
+                ATT_Section_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    INP_Default = 1,
+                    LBLC_NumInputs = 17,
+                    LBLC_DropDownButton = true,
+                    IC_Visible = false,
+					CntToHide = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                ATT_Section_Sep = {
+                    INPID_InputControl = "SeparatorControl",
+                    IC_Visible = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                ATT_Title_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = '<p style="color: #5f9920">Control Attrs</p>',
+                },
+                ATT_Dummy1_Spc = {
+                    INPID_InputControl = "SpacerControl",
+                    ICD_Width = 0.18,
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                },
+                ATT_Active_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Active",
+					BTNCS_Execute = [[
+                        tool:SetInput("ATT_Target_Txt",
+                            comp.ActiveTool
+                            and comp.ActiveTool.Name .. "."
+                            or "No active node"
+                        )
+                    ]],
+				},
+                ATT_Pickup_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.11,
+                    IC_Visible = false,
+                    LBLC_DropDownButton = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = '<p style="color: #f6f6f6; text-align: right">Pickup</p>',
+                },
+                ATT_TargetPicker_Txt = {
+                    INPID_InputControl = "TextEditControl",
+                    LINKID_DataType = "Text",
+                    TEC_Lines = 1,
+                    ICD_Width = 0.06,
+                    IC_Visible = false,
+                    TEC_ReadOnly = true,
+                    INP_Passive = true,
+                    IC_NoReset = true,
+                    TEC_Wrap = false,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Target Picker",
+                    INPS_DefaultText = "",
+                    INPS_ExecuteOnChange = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.PickUpTarget(self, "ATT")
+                    ]],
+                },
+                ATT_ToolTip_Mbt = {
+					INPID_InputControl = "MultiButtonControl",
+					LINKID_DataType = "Number",
+					ICD_Width = 0.2,
+                    IC_Visible = false,
+					MBTNC_ShowBasicButton = true,
+					MBTNC_ShowToolTip = true,
+					MBTNC_ShowName = true,
+					IC_NoReset = true,
+					IC_NoLabel = true,
+                    INP_External = false,
+					MBTNC_StretchToFit = false,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "ToolTip",
+					{
+                        MBTNC_AddButton = "?",
+                        MBTNCS_ToolTip =
+                            'Right-click => Expression => Drag from the "+" button\n' ..
+                            'to the target and release to reflect it in the input field.'
+                    },
+                    INPS_ExecuteOnChange = [[
+                        tool:SetInput("ATT_TextBox_Txt",
+                            self:GetAttrs().INPST_MultiButtonControl_ToolTip[1]
+                        )
+                    ]],
+				},
+                ATT_FormCopy_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Copy",
+					BTNCS_Execute = "bmd.setclipboard(tool:GetInput('ATT_Target_Txt'))",
+				},
+                ATT_FormClear_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Clear",
+					BTNCS_Execute = "tool:SetInput('ATT_Target_Txt', '')",
+				},
+                ATT_Target_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.155,
+                    IC_Visible = false,
+                    LBLC_DropDownButton = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = '<p style="color: #f6f6f6; text-align: right">Target</p>',
+                },
+                ATT_Target_Txt = {
+                    INPID_InputControl = "TextEditControl",
+                    LINKID_DataType = "Text",
+                    TEC_Lines = 1,
+                    ICD_Width = 0.845,
+                    IC_Visible = false,
+                    INP_Passive = true,
+                    IC_NoReset = true,
+                    TEC_Wrap = false,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Target",
+                },
+                ATT_1_Spc = {
+                    INPID_InputControl = "SpacerControl",
+                    IC_Visible = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                ATT_FormatSelect_Mbt = {
+                    INPID_InputControl = "MultiButtonIDControl",
+                    LINKID_DataType = "FuID",
+                    { MBTNC_AddButton = "TXT",  MBTNCID_AddID = "txt" },
+                    { MBTNC_AddButton = "HTML", MBTNCID_AddID = "html" },
+                    { MBTNC_AddButton = "CSV",  MBTNCID_AddID = "csv" },
+                    ICD_Width = 0.5,
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    INPID_DefaultID = "txt",
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Format Select",
+                    INPS_ExecuteOnChange = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.ApplyFormat("attrs", self[0])
+                    ]],
+                },
+                ATT_Update_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.2,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Update",
+					BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.ApplyUpdate("attrs")
+                    ]],
+                },
+                ATT_TextCopy_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Copy",
+                    BTNCS_Execute = "bmd.setclipboard(tool:GetInput('ATT_TextBox_Txt'))",
+                },
+                ATT_TextClear_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Clear",
+					BTNCS_Execute = "tool:SetInput('ATT_TextBox_Txt', '')",
+				},
+                ATT_TextBox_Txt = {
+                    INPID_InputControl = "TextEditControl",
+                    LINKID_DataType = "Text",
+                    TEC_Lines = 10,
+                    ICD_Width = 1,
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_Passive = true,
+                    TEC_Wrap = false,
+                    TECS_Language = "lua",
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Attrs List Text Box",
+                    INPS_DefaultText =  "-- Enter the target --\n" ..
+                                        "-- Select option (Format) --\n" ..
+                                        "-- Press the Update button --"
+                },
+        -- Script Secton
+                SCR_Section_Lbl ={
+                    INPID_InputControl = "LabelControl",
+                    INP_Default = 1,
+                    LBLC_NumInputs = 17,
+                    IC_Visible = false,
+					CntToHide = true,
+                    LBLC_DropDownButton = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                SCR_Section_Sep = {
+                    INPID_InputControl = "SeparatorControl",
+                    IC_Visible = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                SCR_Title_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = '<p style="color: #e85545">Script </p>',
+                },
+                SCR_Dummy1_Spc = {
+                    INPID_InputControl = "SpacerControl",
+                    ICD_Width = 0.18,
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                },
+                SCR_Active_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Active",
+					BTNCS_Execute = [[
+                        tool:SetInput("SCR_Target_Txt",
+                            comp.ActiveTool
+                            and comp.ActiveTool.Name .. "."
+                            or "No active node"
+                        )
+                    ]],
+				},
+                SCR_Pickup_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.11,
+                    IC_Visible = false,
+                    LBLC_DropDownButton = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = '<p style="color: #f6f6f6; text-align: right">Pickup</p>',
+                },
+                SCR_TargetPicker_Txt = {
+                    INPID_InputControl = "TextEditControl",
+                    LINKID_DataType = "Text",
+                    TEC_Lines = 1,
+                    ICD_Width = 0.06,
+                    IC_Visible = false,
+                    TEC_ReadOnly = true,
+                    INP_Passive = true,
+                    IC_NoReset = true,
+                    TEC_Wrap = false,
+                    INPS_DefaultText = "",
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Target Picker",
+                    INPS_ExecuteOnChange = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.PickUpTarget(self, "SCR")
+                    ]],
+                },
+                SCR_ToolTip_Mbt = {
+					INPID_InputControl = "MultiButtonControl",
+					LINKID_DataType = "Number",
+					ICD_Width = 0.2,
+                    IC_Visible = false,
+					MBTNC_ShowBasicButton = true,
+					MBTNC_ShowToolTip = true,
+					MBTNC_ShowName = true,
+					IC_NoReset = true,
+					IC_NoLabel = true,
+                    INP_External = false,
+					MBTNC_StretchToFit = false,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "ToolTip",
+					{
+                        MBTNC_AddButton = "?",
+                        MBTNCS_ToolTip =
+                            'Right-click => Expression => Drag from the "+" button\n' ..
+                            'to the target and release to reflect it in the input field.'
+                    },
+                    INPS_ExecuteOnChange = [[
+                        tool:SetInput("SCR_TextBox_Txt",
+                            self:GetAttrs().INPST_MultiButtonControl_ToolTip[1]
+                        )
+                    ]]
+				},
+                SCR_FormCopy_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Copy",
+					BTNCS_Execute = "bmd.setclipboard(tool:GetInput('SCR_Target_Txt'))",
+				},
+                SCR_FormClear_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Clear",
+					BTNCS_Execute = "tool:SetInput('SCR_Target_Txt', '')",
+				},
+                SCR_Target_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.155,
+                    IC_Visible = false,
+                    LBLC_DropDownButton = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = '<p style="color: #f6f6f6; text-align: right">Target</p>',
+                },
+                SCR_Target_Txt = {
+                    INPID_InputControl = "TextEditControl",
+                    LINKID_DataType = "Text",
+                    ICD_Width = 0.845,
+                    TEC_Lines = 1,
+                    IC_Visible = false,
+                    INP_External = false,
+                    INP_Passive = true,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    TEC_Wrap = false,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Target",
+                },
+                SCR_1_Spc = {
+                    INPID_InputControl = "SpacerControl",
+                    IC_Visible = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                SCR_ScriptType_Cmb = {
+                    INPID_InputControl = "ComboIDControl",
+                    LINKID_DataType = "FuID",
+                    { CCS_AddString = "Expression", CCID_AddID = "Expression" },
+                    { CCS_AddString = "Execute On Change", CCID_AddID = "OnChange" },
+                    { CCS_AddString = "Button Execute (UserControl)", CCID_AddID = "Button" },
+                    ICD_Width = 0.5,
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_Integer = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "ScriptType",
+                },
+                SCR_Get_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.2,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Get",
+					BTNCS_Execute = [[
+                        NodeExplorerUtilityLibrary.GetScript()
+                    ]],
+				},
+                SCR_TextCopy_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Copy",
+                    BTNCS_Execute = "bmd.setclipboard(tool:GetInput('SCR_TextBox_Txt'))",
+                },
+                SCR_TextClear_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.15,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Clear",
+					BTNCS_Execute = "tool:SetInput('SCR_TextBox_Txt', '')",
+				},
+                SCR_TextBox_Txt = {
+                    INPID_InputControl = "TextEditControl",
+                    LINKID_DataType = "Text",
+                    TEC_Lines = 20,
+                    ICD_Width = 1,
+                    IC_Visible = false,
+                    INP_External = false,
+                    INP_Passive = true,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    TEC_Wrap = false,
+                    TECS_Language = "lua",
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Text box to display the script",
+                    INPS_DefaultText =  "-- Enter the target --\n" ..
+                                        "-- Select option (ScriptType) --\n" ..
+                                        "-- Press the Get button --",
+                },
+        -- Clipboad Section
+                CLP_Section_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    INP_Default = 1,
+                    LBLC_NumInputs = 5,
+                    IC_Visible = false,
+					CntToHide = true,
+                    LBLC_DropDownButton = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                CLP_Section_Sep = {
+                    INPID_InputControl = "SeparatorControl",
+                    IC_Visible = false,
+                    ICS_ControlPage = "Explorer",
+                },
+                CLP_Title_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = '<p style="color: #f6f6f6;">Clipboad</p>',
+                },
+                CLP_Paste_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.2,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "Paste",
+                    BTNCS_Execute = [[
+                        tool.CLP_Viewer_Lbl:SetAttrs({INPS_Name = bmd.getclipboard()})
+                    ]],
+                },
+                CLP_Clear_Btn = {
+					INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.2,
+                    IC_Visible = false,
+					INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					LINKS_Name = "Clear",
+					BTNCS_Execute = "tool.CLP_Viewer_Lbl:SetAttrs({INPS_Name = ''})"
+				},
+                CLP_Viewer_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 1,
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    LBLC_MultiLine = true,
+                    ICS_ControlPage = "Explorer",
+                    LINKS_Name = "",
+                },
+        -- Power Button Section
+                POW_PageEnd_Spc = {
+                    INPID_InputControl = "SpacerControl",
+                    ICS_ControlPage = "Explorer",
+					CntToHide = true,
+                    ICD_Width = 0.3,
+                },
+                POW_MainPower_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Explorer",
+					CntToHide = true,
+                    LINKS_Name = "POWER",
+					BTNCS_Execute = [[
+                        comp:Execute(tool:GetData("NE_Lib"))
+						self:SetAttrs({INPB_IC_Visible = false})
+					]],
+                },
+    -- Config page
+        -- Cache Data Section
+                CCH_DummyDropDown_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    LBLC_DropDownButton = true,
+                    ICD_Width = 0.7,
+                    INP_Default = 1,
+                    LBLC_NumInputs = 0,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Cache Data",
+                    INPS_ExecuteOnChange = "tool:SetInput('CCH_Section_Lbl', self[0])"
+                },
+                CCH_ClearAll_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear All Caches",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        for _, group in ipairs({"node", "control", "attrs"}) do
+                            lib.RefreshCacheGroup(group)
+                        end
+                    ]],
+                },
+                CCH_Section_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    INP_Default = 1,
+                    LBLC_NumInputs = 27,
+                    LBLC_DropDownButton = true,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    IC_Visible = false,
+					CntToHide = true,
+                    ICS_ControlPage = "Status",
+                },
+                CCH_Node_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.625,
+                    INP_Default = 1,
+                    LBLC_NumInputs = 8,
+                    IC_Visible = false,
+                    LBLC_DropDownButton = true,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Node",
+                },
+                CCH_Short1_Spc = {
+                    INPID_InputControl = "SpacerControl",
+                    ICD_Width = 0.125,
+                    IC_Visible = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    IC_SkipNest = true,
+                    ICS_ControlPage = "Status",
+                },
+                CCH_NodeClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.25,
+                    IC_Visible = false,
+                    IC_SkipNest = true,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear group-N",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCacheGroup("node")
+                    ]],
+                },
+                CCH_NodeList_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.7,
+                    IC_Visible = false,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    ICS_Label = "List",
+                    LINKS_Name = '<p style="color: #5a5f66">○</p>',
+                },
+                CCH_NodeListClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCache("NodeList", "CCH_NodeList_Lbl")
+                    ]],
+                },
+                CCH_NodeTxt_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.7,
+                    IC_Visible = false,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    ICS_Label = "Text",
+                    LINKS_Name ='<p style="color: #5a5f66">○</p>',
+                },
+                CCH_NodeTxtClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCache("NodeListText", "CCH_NodeTxt_Lbl")
+                    ]],
+                },
+                CCH_NodeHtml_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.7,
+                    IC_Visible = false,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    ICS_Label = "Html",
+                    LINKS_Name = '<p style="color: #5a5f66">○</p>',
+                },
+                CCH_NodeHtmlClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCache("NodeListHtml", "CCH_NodeHtml_Lbl")
+                    ]],
+                },
+                CCH_NodeCSV_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.7,
+                    IC_Visible = false,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    ICS_Label = "CSV",
+                    LINKS_Name = '<p style="color: #5a5f66">○</p>',
+                },
+                CCH_NodeCSVClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCache("NodeListCSV", "CCH_NodeCSV_Lbl")
+                    ]],
+                },
+                CCH_Control_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.75,
+                    INP_Default = 1,
+                    LBLC_NumInputs = 8,
+                    IC_Visible = false,
+                    LBLC_DropDownButton = true,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Control",
+                },
+                CCH_ControlClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.25,
+                    IC_Visible = false,
+                    IC_SkipNest = true,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear group-C",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCacheGroup("control")
+                    ]],
+                },
+                CCH_ControlList_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.7,
+                    IC_Visible = false,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    ICS_Label = "List",
+                    LINKS_Name = '<p style="color: #5a5f66">○</p>',
+                },
+                CCH_ControlListClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCache("ControlList", "CCH_ControlList_Lbl")
+                    ]],
+                },
+                CCH_ControlTxt_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.7,
+                    IC_Visible = false,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    ICS_Label = "Text",
+                    LINKS_Name ='<p style="color: #5a5f66">○</p>',
+                },
+                CCH_ControlTxtClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCache("ControlListText", "CCH_ControlTxt_Lbl")
+                    ]],
+                },
+                CCH_ControlHtml_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.7,
+                    IC_Visible = false,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    ICS_Label = "Html",
+                    LINKS_Name = '<p style="color: #5a5f66">○</p>',
+                },
+                CCH_ControlHtmlClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCache("ControlListHtml", "CCH_ControlHtml_Lbl")
+                    ]],
+                },
+                CCH_ControlCSV_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.7,
+                    IC_Visible = false,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    ICS_Label = "CSV",
+                    LINKS_Name = '<p style="color: #5a5f66">○</p>',
+                },
+                CCH_ControlCSVClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCache("ControlListCSV", "CCH_ControlCSV_Lbl")
+                    ]],
+                },
+                CCH_Attrs_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.75,
+                    INP_Default = 1,
+                    LBLC_NumInputs = 8,
+                    IC_Visible = false,
+                    LBLC_DropDownButton = true,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Attrs",
+                },
+                CCH_AttrsClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.25,
+                    IC_Visible = false,
+                    IC_SkipNest = true,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear group-A",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCacheGroup("attrs")
+                    ]],
+                },
+                CCH_AttrsList_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.7,
+                    IC_Visible = false,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    ICS_Label = "List",
+                    LINKS_Name = '<p style="color: #5a5f66">○</p>',
+                },
+                CCH_AttrsListClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCache("AttrsList", "CCH_AttrsList_Lbl")
+                    ]],
+                },
+                CCH_AttrsTxt_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    IC_Visible = false,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    ICS_Label = "Text",
+                    ICD_Width = 0.7,
+                    LINKS_Name ='<p style="color: #5a5f66">○</p>',
+                },
+                CCH_AttrsTxtClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCache("AttrsListText", "CCH_AttrsTxt_Lbl")
+                    ]],
+                },
+                CCH_AttrsHtml_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.7,
+                    IC_Visible = false,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    ICS_Label = "Html",
+                    LINKS_Name = '<p style="color: #5a5f66">○</p>',
+                },
+                CCH_AttrsHtmlClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCache("AttrsListHtml", "CCH_AttrsHtml_Lbl")
+                    ]],
+                },
+                CCH_AttrsCSV_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    ICD_Width = 0.7,
+                    IC_Visible = false,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    ICS_Label = "CSV",
+                    LINKS_Name = '<p style="color: #5a5f66">○</p>',
+                },
+                CCH_AttrsCSVClear_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    IC_Visible = false,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Clear",
+                    BTNCS_Execute = [[
+                        local lib = NodeExplorerUtilityLibrary
+                        lib.RefreshCache("AttrsListCSV", "CCH_AttrsCSV_Lbl")
+                    ]],
+                },
+        -- Library Loading Section
+                LIB_Loading_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    INP_Default = 1,
+                    LBLC_NumInputs = 2,
+                    ICD_Width = 0.7,
+                    LBLC_DropDownButton = true,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    INP_External = false,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Library Loading",
+                },
+                LIB_Reload_Btn = {
+                    INPID_InputControl = "ButtonControl",
+                    LINKID_DataType = "Number",
+                    ICD_Width = 0.3,
+                    INP_Disabled = true,
+                    INP_External = false,
+                    IC_NoLabel = true,
+                    IC_NoReset = true,
+                    IC_SkipNest = true,
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = "Reload Library",
+                    BTNCS_Execute = [[
+                        comp:Execute(tool:GetData("NE_Lib"))
+                    ]],
+                },
+                LIB_Status_Lbl = {
+                    INPID_InputControl = "LabelControl",
+                    LINKID_DataType = "Number",
+                    INP_Default = 0,
+                    INP_External = false,
+                    IC_NoReset = true,
+                    ICS_Label = "status :",
+                    ICS_ControlPage = "Status",
+                    LINKS_Name = '<p style="color: #5a5f66">Not loaded</p>',
+                    INPS_ExecuteOnChange = [[
+                        if self[0] == 1 then
+                            local lib = NodeExplorerUtilityLibrary
+                            if lib and type(lib.ApplyUpdate) == "function" then
+                                lib.InitializeNE()
+                            else
+                                self:SetAttrs({
+                                    INPS_Name = '<p style="color: #e85545">Loading failed</p>'
+                                })
+                                tool.LIB_Reload_Btn:SetAttrs({INPB_Disabled = false})
+                                self[0] = 0
+                            end
+                        end
+                    ]],
+                },
+-- Control Page settings
+                Explorer = ControlPage {
+                    CT_Priority = 2,
+                    CTID_DIB_ID = "Icons.Tools.Tabs.Solve",
+                },
+                Status = ControlPage {
+                    CT_Priority = 1,
+                    CTID_DIB_ID = "Icons.Tools.Tabs.Controls",
+                },
+                User = ControlPage {
+                    CT_Priority = 0,
+                    CT_Visible = false,
+                },
+                Common = ControlPage {
+                    CT_Priority = 0,
+                    CT_Visible = false,
+                },
+            },
+		},
+	},
+	ActiveTool = "NodeExplorer"
+}
