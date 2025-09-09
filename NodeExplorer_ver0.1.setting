@@ -4,7 +4,6 @@
             PassThrough = true,
 			CtrlWZoom = false,
 			NameSet = true,
-			ViewInfo = OperatorInfo { Pos = { 7645, -115.5 } },
 -- Custom Data Section
             CustomData = {
                 NE_Lib = [=[
@@ -953,7 +952,7 @@
                     { MBTNC_AddButton = "Attrs", },
                     { MBTNC_AddButton = "Script", },
                     { MBTNC_AddButton = "Clip", },
-                    INP_Default = 31,
+                    INP_Default = 31, -- 31 = 1+2+4+8+16 (All sections visible by default)
                     IC_Visible = false,
                     INP_Integer = true,
                     INP_External = false,

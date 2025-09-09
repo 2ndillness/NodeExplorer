@@ -1,3 +1,5 @@
+[English Version](README.en.md)
+
 # Node Explorer for DaVinci Resolve/Fusion
 
 ## `NodeExplorer` は何？  
