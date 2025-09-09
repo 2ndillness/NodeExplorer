@@ -40,6 +40,7 @@ For repeated use, place the file in the DaVinci Resolve Macros folder to call it
 ### On First Launch and Restart
 `NodeExplorer` requires an initialization step on first launch and restart.
 First, press the `POWER` button. The UI will appear if initialization is successful.
+
 ![POWER Button](images/Power_Btn.png)
 
 ### Tab Structure
